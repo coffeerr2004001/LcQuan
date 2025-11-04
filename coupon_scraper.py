@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import re
 import socket
@@ -127,9 +128,91 @@ def filterCoupons(couponList: List[Dict[str, Any]], keywordList: Sequence[str]) 
     return filteredList
 
 
+def filterCouponsByValue(couponList: List[Dict[str, Any]], maxActualPay: float = 5.0, minCouponAmount: float = 10.0) -> List[Dict[str, Any]]:
+    """
+    过滤优惠券: 实际支付<=maxActualPay 且 券面额>=minCouponAmount
+    实际支付 = 满减金额 - 券面额
+    """
+    filteredList: List[Dict[str, Any]] = []
+    for coupon in couponList:
+        couponAmount = coupon.get("couponAmount") or 0
+        minOrderMoney = coupon.get("minOrderMoney") or 0
+        
+        # 计算实际支付金额
+        actualPay = minOrderMoney - couponAmount
+        
+        # 应用过滤条件
+        if actualPay <= maxActualPay and couponAmount >= minCouponAmount:
+            filteredList.append(coupon)
+    
+    return filteredList
+
+
 def dumpCouponJson(couponList: List[Dict[str, Any]], outputPath: str) -> None:
     with open(outputPath, "w", encoding="utf-8") as fileObject:
         json.dump(couponList, fileObject, ensure_ascii=False, indent=2)
+
+
+def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
+    """将优惠券列表输出为CSV文件"""
+    if not couponList:
+        # 如果没有数据，创建空文件
+        with open(outputPath, "w", encoding="utf-8-sig", newline="") as fileObject:
+            pass
+        return
+    
+    # 定义CSV列
+    fieldNames = [
+        "partitionName",
+        "couponName", 
+        "couponAmount",
+        "minOrderMoney",
+        "actualPay",
+        "validity",
+        "receiveCustomerNum",
+        "customerMaxNum",
+        "limitBrandNames",
+        "targetUrl"
+    ]
+    
+    columnHeaders = {
+        "partitionName": "分区",
+        "couponName": "优惠券名称",
+        "couponAmount": "面额(元)",
+        "minOrderMoney": "满减金额(元)",
+        "actualPay": "实际支付(元)",
+        "validity": "有效期",
+        "receiveCustomerNum": "领取人数",
+        "customerMaxNum": "每人限领",
+        "limitBrandNames": "品牌限制",
+        "targetUrl": "链接"
+    }
+    
+    with open(outputPath, "w", encoding="utf-8-sig", newline="") as fileObject:
+        writer = csv.DictWriter(fileObject, fieldnames=fieldNames)
+        
+        # 写入中文表头
+        writer.writerow(columnHeaders)
+        
+        # 写入数据
+        for coupon in couponList:
+            couponAmount = coupon.get("couponAmount") or 0
+            minOrderMoney = coupon.get("minOrderMoney") or 0
+            actualPay = minOrderMoney - couponAmount
+            
+            rowData = {
+                "partitionName": coupon.get("partitionName") or "",
+                "couponName": coupon.get("couponName") or "",
+                "couponAmount": couponAmount,
+                "minOrderMoney": minOrderMoney,
+                "actualPay": actualPay,
+                "validity": coupon.get("validity") or "",
+                "receiveCustomerNum": coupon.get("receiveCustomerNum") or "",
+                "customerMaxNum": coupon.get("customerMaxNum") or "",
+                "limitBrandNames": coupon.get("limitBrandNames") or "无",
+                "targetUrl": coupon.get("targetUrl") or ""
+            }
+            writer.writerow(rowData)
 
 
 def renderCouponSummary(couponList: List[Dict[str, Any]]) -> None:
@@ -159,10 +242,13 @@ def runCrawler() -> None:
     argParser = argparse.ArgumentParser(description="抓取立创商城优惠券中心全部优惠券数据")
     argParser.add_argument("--keyword", "-k", action="append", dest="keywordList", help="根据优惠券名称关键词过滤, 可重复指定")
     argParser.add_argument("--json", dest="jsonPath", help="将结果写入指定JSON文件")
+    argParser.add_argument("--csv", dest="csvPath", help="将结果写入指定CSV文件")
     argParser.add_argument("--limit", type=int, default=0, help="限制输出前N条结果")
     argParser.add_argument("--silent", action="store_true", help="仅抓取数据不在终端打印概要")
     argParser.add_argument("--url", default=COUPON_CENTER_URL, help="自定义优惠券页面URL")
     argParser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="请求超时时间(秒)")
+    argParser.add_argument("--max-actual-pay", type=float, default=None, help="过滤: 实际支付金额上限(元)")
+    argParser.add_argument("--min-coupon-amount", type=float, default=None, help="过滤: 券面额下限(元)")
     cliArgs = argParser.parse_args()
 
     try:
@@ -178,11 +264,21 @@ def runCrawler() -> None:
 
     keywordList = cliArgs.keywordList or []
     filteredList = filterCoupons(couponList, keywordList)
+    
+    # 应用价值过滤
+    if cliArgs.max_actual_pay is not None or cliArgs.min_coupon_amount is not None:
+        maxActualPay = cliArgs.max_actual_pay if cliArgs.max_actual_pay is not None else float('inf')
+        minCouponAmount = cliArgs.min_coupon_amount if cliArgs.min_coupon_amount is not None else 0.0
+        filteredList = filterCouponsByValue(filteredList, maxActualPay, minCouponAmount)
+    
     if cliArgs.limit:
         filteredList = filteredList[: cliArgs.limit]
 
     if cliArgs.jsonPath:
         dumpCouponJson(filteredList, cliArgs.jsonPath)
+    
+    if cliArgs.csvPath:
+        dumpCouponCsv(filteredList, cliArgs.csvPath)
 
     if not cliArgs.silent:
         print(f"共抓取优惠券: {len(couponList)} 条, 当前展示: {len(filteredList)} 条")
