@@ -3,7 +3,9 @@ import csv
 import json
 import re
 import socket
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,6 +16,9 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+BRAND_PRODUCT_SCRIPT = SCRIPT_ROOT / "scripts" / "fetch_brand_products.js"
 
 
 def fetchCouponPage(url: str = COUPON_CENTER_URL, timeout: int = DEFAULT_TIMEOUT) -> str:
@@ -148,6 +153,41 @@ def filterCouponsByValue(couponList: List[Dict[str, Any]], maxActualPay: float =
     return filteredList
 
 
+def fetchBrandProducts(targetUrl: str, timeout: int = 120) -> List[Dict[str, Any]]:
+    if not targetUrl:
+        return []
+    if not BRAND_PRODUCT_SCRIPT.exists():
+        raise FileNotFoundError(
+            "未找到品牌商品抓取脚本 fetch_brand_products.js, 请确认 scripts 目录存在该文件"
+        )
+
+    process = subprocess.run(
+        ["node", str(BRAND_PRODUCT_SCRIPT), targetUrl],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+    if process.returncode != 0:
+        stderrMessage = process.stderr.strip() or "抓取品牌商品失败"
+        raise RuntimeError(stderrMessage)
+
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"解析品牌商品数据失败: {error}") from error
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise RuntimeError(payload.get("error"))
+
+    products = payload.get("products")
+    if isinstance(products, list):
+        return products
+    return []
+
+
 def dumpCouponJson(couponList: List[Dict[str, Any]], outputPath: str) -> None:
     with open(outputPath, "w", encoding="utf-8") as fileObject:
         json.dump(couponList, fileObject, ensure_ascii=False, indent=2)
@@ -164,7 +204,7 @@ def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
     # 定义CSV列
     fieldNames = [
         "partitionName",
-        "couponName", 
+        "couponName",
         "couponAmount",
         "minOrderMoney",
         "actualPay",
@@ -172,9 +212,10 @@ def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
         "receiveCustomerNum",
         "customerMaxNum",
         "limitBrandNames",
-        "targetUrl"
+        "targetUrl",
+        "availableProducts",
     ]
-    
+
     columnHeaders = {
         "partitionName": "分区",
         "couponName": "优惠券名称",
@@ -185,7 +226,8 @@ def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
         "receiveCustomerNum": "领取人数",
         "customerMaxNum": "每人限领",
         "limitBrandNames": "品牌限制",
-        "targetUrl": "链接"
+        "targetUrl": "链接",
+        "availableProducts": "有货商品",
     }
     
     with open(outputPath, "w", encoding="utf-8-sig", newline="") as fileObject:
@@ -199,7 +241,12 @@ def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
             couponAmount = coupon.get("couponAmount") or 0
             minOrderMoney = coupon.get("minOrderMoney") or 0
             actualPay = minOrderMoney - couponAmount
-            
+            productEntries = coupon.get("availableProducts") or []
+            productSummary = " | ".join(
+                f"{item.get('name')}<{item.get('link')}>"
+                for item in productEntries
+            )
+
             rowData = {
                 "partitionName": coupon.get("partitionName") or "",
                 "couponName": coupon.get("couponName") or "",
@@ -210,7 +257,8 @@ def dumpCouponCsv(couponList: List[Dict[str, Any]], outputPath: str) -> None:
                 "receiveCustomerNum": coupon.get("receiveCustomerNum") or "",
                 "customerMaxNum": coupon.get("customerMaxNum") or "",
                 "limitBrandNames": coupon.get("limitBrandNames") or "无",
-                "targetUrl": coupon.get("targetUrl") or ""
+                "targetUrl": coupon.get("targetUrl") or "",
+                "availableProducts": productSummary,
             }
             writer.writerow(rowData)
 
@@ -235,6 +283,20 @@ def renderCouponSummary(couponList: List[Dict[str, Any]]) -> None:
         print(f"     领取人数: {receiveCount} | 每人限领: {maxNum}")
         print(f"     {brandText}")
         print(f"     链接: {coupon.get('targetUrl')}")
+        availableProducts = coupon.get("availableProducts") or []
+        if availableProducts:
+            previewList = availableProducts[:3]
+            productLines = [
+                f"     - {item.get('name')} ({item.get('link')})"
+                for item in previewList
+            ]
+            print("     有货商品:")
+            for line in productLines:
+                print(line)
+            if len(availableProducts) > len(previewList):
+                print(f"     ... 共 {len(availableProducts)} 个有货商品")
+        elif coupon.get("productFetchError"):
+            print(f"     有货商品: 获取失败 - {coupon.get('productFetchError')}")
         print("")
 
 
@@ -273,6 +335,33 @@ def runCrawler() -> None:
     
     if cliArgs.limit:
         filteredList = filteredList[: cliArgs.limit]
+
+    productCache: Dict[str, List[Dict[str, Any]]] = {}
+    for coupon in filteredList:
+        targetUrl = coupon.get("targetUrl") or ""
+        if not targetUrl:
+            coupon["availableProducts"] = []
+            continue
+        if targetUrl not in productCache:
+            try:
+                products = fetchBrandProducts(targetUrl)
+                products = [
+                    {
+                        "name": item.get("name"),
+                        "link": item.get("link"),
+                        "productCode": item.get("productCode"),
+                        "stockText": item.get("stockText"),
+                        "totalStock": item.get("totalStock"),
+                        "warehouses": item.get("warehouses") or [],
+                    }
+                    for item in products
+                    if item.get("hasStock")
+                ]
+            except Exception as error:  # pylint: disable=broad-except
+                coupon["productFetchError"] = str(error)
+                products = []
+            productCache[targetUrl] = products
+        coupon["availableProducts"] = productCache.get(targetUrl, [])
 
     if cliArgs.jsonPath:
         dumpCouponJson(filteredList, cliArgs.jsonPath)
